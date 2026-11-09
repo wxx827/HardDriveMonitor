@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-from . import util
+from . import __version__, util
 from .config import Config, is_local_url, normalize_base_url
 from .index import Index
 from .util import GB, MB
@@ -43,7 +43,10 @@ def build_context(
     max_files: int = 40,
     max_folders: int = 20,
 ) -> dict:
-    """收集给 AI（或离线引擎）的结构化上下文；默认对用户名脱敏。"""
+    """收集给 AI（或离线引擎）的结构化上下文；默认对用户名脱敏。
+
+    只用走索引的小查询：索引库有几百 MB，COUNT(*) 之类的全表统计冷启动要好几秒。
+    """
     username = os.environ.get("USERNAME") or ""
 
     def mask_path(path: str) -> str:
@@ -62,27 +65,50 @@ def build_context(
             }
         )
 
-    big_rows, _n, _sum = index.big_files(page=0, page_size=max_files, include_system=True)
-    top_files = [
-        {
+    def file_row(row) -> dict:
+        return {
             "路径": mask_path(row["path"]),
             "大小MB": round(row["size"] / MB, 1),
             "修改日期": util.fmt_date(row["mtime"]),
             "扩展名": row["ext"] or "无",
             "标记": _flags_text(row["flags"]),
         }
-        for row in big_rows
-    ]
 
-    folders = index.top_folders_all(limit=max_folders)
-    top_folders = [
-        {
-            "目录": mask_path(row["path"]),
-            "大小GB": round(row["size"] / GB, 2),
-            "文件数": row["files"],
-        }
-        for row in folders
-    ]
+    def folder_row(row) -> dict:
+        return {"目录": mask_path(row["path"]), "大小GB": round(row["size"] / GB, 2), "文件数": row["files"]}
+
+    big_rows, _n, _sum = index.big_files(page=0, page_size=max(max_files, 300), include_system=True)
+    top_files = [file_row(row) for row in big_rows[:max_files]]
+    week_ago = util.now_ts() - 7 * 86400
+    recent_big = [file_row(row) for row in big_rows if (row["mtime"] or 0) >= week_ago][:15]
+
+    top_folders = [folder_row(row) for row in index.top_folders_all(limit=max_folders)]
+    drive_folders = {
+        vol.letter: [folder_row(row) for row in index.top_folders(vol.letter, 8)] for vol in volumes
+    }
+    hotspots = {}
+    for vol in volumes:
+        chain = _hotspot(index, vol.letter + "\\")
+        if chain:
+            hotspots[vol.letter] = [
+                {"目录": mask_path(node["path"]), "大小GB": round(node["size"] / GB, 2),
+                 "子文件夹": [folder_row(row) for row in kids]}
+                for node, kids in chain
+            ]
+
+    growth_rows = []
+    try:
+        from .monitor import growth
+
+        for row in growth(index, limit=12)["rows"]:
+            growth_rows.append({
+                "目录": mask_path(row["path"]),
+                "增长GB": round(row["delta"] / GB, 2),
+                "现在GB": round(row["after"] / GB, 2),
+                "新出现": bool(row["new"]),
+            })
+    except Exception:  # noqa: BLE001
+        pass
 
     cleanup = []
     for item in cleanup_items or []:
@@ -98,20 +124,41 @@ def build_context(
             }
         )
 
-    counts = index.counts()
-    try:
-        recent_rows, recent_n, recent_total = index.recent_files(days=7, page=0, page_size=1)
-    except Exception:  # noqa: BLE001
-        recent_n, recent_total = 0, 0
+    scan = index.last_scan() or {}
     return {
         "磁盘": drive_data,
         "大文件Top": top_files,
         "占用最大的文件夹": top_folders,
+        "各盘最大文件夹": drive_folders,
+        "大目录细分": hotspots,
         "清理候选": cleanup,
-        "索引统计": counts,
-        "最近7天": {"文件数": recent_n, "合计GB": round(recent_total / GB, 2)},
+        "最近7天变动的大文件": recent_big,
+        "最近增长最多的目录": growth_rows,
+        "索引统计": {"文件数": scan.get("files") or 0, "目录数": scan.get("dirs") or 0,
+                     "总大小GB": round((scan.get("bytes") or 0) / GB, 1)},
         "扫描时间": util.fmt_time(index.last_scan_time() or None),
     }
+
+
+def _hotspot(index: Index, root: str, max_levels: int = 4, limit: int = 8) -> list[tuple[dict, list[dict]]]:
+    """从盘根往下钻：最大的子目录占上一级一半以上就继续往下（如 C:\\ → Users → wjx → AppData）。
+    返回沿途每一级的 (目录, 最大子目录)；只有一个子目录几乎占满的过渡层（如 Users）不列出。"""
+    kids = index.folder_children(root, 200)
+    total = sum(k["size"] for k in kids)
+    if not kids or kids[0]["size"] < total * 0.5:
+        return []
+    chain = []
+    node = kids[0]
+    for _ in range(max_levels):
+        kids = index.folder_children(node["path"], limit)
+        if not kids:
+            break
+        if kids[0]["size"] < node["size"] * 0.9:
+            chain.append((node, kids))
+        if kids[0]["size"] < node["size"] * 0.5:
+            break
+        node = kids[0]
+    return chain
 
 
 def _flags_text(flags: int) -> str:
@@ -258,6 +305,14 @@ def offline_report(context: dict, selection: list[dict] | None = None) -> str:
     if not context.get("大文件Top"):
         lines.append("- 还没有扫描结果，先点「完整扫描」再分析。")
 
+    grow = context.get("最近增长最多的目录") or []
+    if grow:
+        lines.append("")
+        lines.append("## 最近变大的目录")
+        for g in grow[:6]:
+            lines.append(f"- `{g['目录']}` 增加 **{_gb(g['增长GB'])}**，现在 {_gb(g['现在GB'])}"
+                         + ("（新出现）" if g.get("新出现") else ""))
+
     blocked = [c for c in cleanup if not c.get("可删除") and c.get("大小GB", 0) > 0]
     if blocked:
         lines.append("")
@@ -275,30 +330,287 @@ def offline_report(context: dict, selection: list[dict] | None = None) -> str:
     return "\n".join(lines)
 
 
+# 常见的大块头：(匹配关键词, 名称, 说明)。关键词用小写，按顺序匹配。
+KNOWN_ITEMS = [
+    (("pagefile",), "pagefile.sys（虚拟内存）",
+     "系统虚拟内存文件，**不能直接删**。想让它变小：系统属性 → 高级 → 性能「设置」→ 高级 → 虚拟内存，"
+     "改成自定义大小，或者把它放到 D 盘。"),
+    (("hiberfil", "休眠"), "hiberfil.sys（休眠文件）",
+     "休眠用的内存镜像，通常是内存大小的 40%～75%。不用休眠 / 快速启动的话，以管理员身份运行 "
+     "`powercfg -h off` 就能立刻释放，想恢复再运行 `powercfg -h on`。"),
+    (("swapfile",), "swapfile.sys", "给应用商店应用用的交换文件，一般只有几百 MB，由系统管理，不用处理。"),
+    (("winsxs",), "WinSxS（系统组件存储）",
+     "Windows 组件和更新备份，**不能手动删**。安全瘦身：管理员运行 "
+     "`Dism /Online /Cleanup-Image /StartComponentCleanup`，或「磁盘清理 → 清理系统文件」。"),
+    (("windows\\installer", "installer"), "C:\\Windows\\Installer",
+     "已安装软件的安装 / 修复包，手动删除会导致软件无法卸载或更新，**不要删**。"),
+    (("system volume information", "还原点", "卷影"), "系统还原点（System Volume Information）",
+     "系统还原点和卷影副本。可以在「系统属性 → 系统保护 → 配置」里调小占用上限或删除旧还原点，不要直接删目录。"),
+    (("$recycle.bin", "回收站"), "回收站",
+     "删除的文件都在这里，清空回收站才会真正腾出空间。可以在「清理推荐」里单独清空。"),
+    (("softwaredistribution", "windows 更新", "系统更新", "更新缓存"), "Windows 更新缓存",
+     "Windows 更新下载的安装包，更新完成后一般可以清理。推荐用「磁盘清理 → 清理系统文件 → Windows 更新清理」。"),
+    (("wechat", "微信", "xwechat"), "微信文件",
+     "聊天记录里的图片、视频和文件。在微信「设置 → 存储空间」里清理，或把文件存储位置改到 D 盘；"
+     "直接删目录可能丢聊天记录。"),
+    (("tencent", "qq"), "腾讯软件数据（QQ / QQ 浏览器等）",
+     "QQ 聊天图片、视频、接收的文件和 QQ 浏览器缓存。在 QQ「设置 → 存储管理」里清理或把存储位置改到 D 盘；"
+     "浏览器缓存在浏览器设置里清除。"),
+    (("node_modules",), "node_modules",
+     "前端项目的依赖目录，删掉后在项目里重新 `npm install` 就能恢复。不再维护的旧项目可以放心删。"),
+    (("npm-cache", "npm"), "npm 缓存", "npm 下载缓存，运行 `npm cache clean --force` 可以安全清理。"),
+    (("local\\programs",), "用户级安装的软件",
+     "Cursor、VS Code、Python 等「只为当前用户安装」的软件。不用的到「设置 → 应用」里卸载，不要直接删目录。"),
+    (("anaconda", "miniconda", "conda", "pkgs"), "Conda / Anaconda",
+     "`pkgs` 是安装包缓存，运行 `conda clean --all` 可以安全清掉；`envs` 是虚拟环境，删除前确认不再使用。"),
+    (("pip",), "pip 缓存", "pip 下载缓存，运行 `pip cache purge` 可以安全清理，需要时会重新下载。"),
+    (("huggingface", ".cache"), "模型 / 下载缓存（.cache）",
+     "HuggingFace、PyTorch 等下载的模型缓存，删了下次用会重新下载。体积大的话可以设置 `HF_HOME` 把缓存挪到 D 盘。"),
+    (("docker", "wsl", "ext4.vhdx"), "Docker / WSL 虚拟磁盘",
+     "虚拟磁盘文件只会变大不会自动缩小。先在 Docker / WSL 里清理（如 `docker system prune`），"
+     "再用 `wsl --shutdown` + 磁盘压缩；不要直接删 .vhdx，否则里面的系统和数据全没了。"),
+    (("appdata",), "AppData",
+     "各种软件的配置、缓存和数据。`Local\\Temp` 和各软件的 Cache 目录可以清，其余目录删前要确认是哪个软件的。"),
+    (("temp", "临时"), "临时文件（Temp）", "程序运行时留下的临时文件，可以安全清理；正在使用的文件会被自动跳过。"),
+    (("downloads", "下载"), "下载文件夹", "下载文件夹里多是安装包和压缩包，装好 / 解压后通常就不再需要，按大小排序逐个确认后删除。"),
+    (("onedrive",), "OneDrive",
+     "OneDrive 同步到本地的文件。右键文件夹选「释放空间」可以只留云端副本，不会删掉云端文件。"),
+    (("program files",), "Program Files（已安装的软件）",
+     "已安装的程序，**不要直接删目录**。到「设置 → 应用」里卸载不用的软件。"),
+]
+
+_WHY = ("满", "不够", "不足", "红", "占用", "去哪", "为什么", "谁占", "吃掉", "爆", "情况", "分析", "快没")
+_CLEAN = ("删", "清理", "释放", "腾", "清除", "瘦身", "回收", "清掉")
+_BIG = ("大文件", "最大的文件", "哪些文件", "大的文件", "文件最大")
+_FOLDER = ("文件夹", "目录")
+_RECENT = ("最近", "突然", "变大", "增长", "膨胀", "新增", "这几天", "涨", "变多")
+_MIGRATE = ("迁移", "搬", "移到", "挪", "转移", "移动")
+_CACHE = ("缓存", "cache")
+_HELP = ("你好", "hello", "能做什么", "怎么用", "帮助", "你是谁", "help")
+_DRIVE_RE = re.compile(r"(?<![a-z])([a-z])\s*(?:盘|:)", re.I)
+
+
+def _has(text: str, words) -> bool:
+    return any(w in text for w in words)
+
+
+def _drive_in(question: str) -> str | None:
+    m = _DRIVE_RE.search(question)
+    return m.group(1).upper() + ":" if m else None
+
+
+def _on_drive(path: str, drive: str | None) -> bool:
+    return not drive or path.upper().startswith(drive)
+
+
+def _gb(value: float) -> str:
+    return util.human_size(float(value) * GB)
+
+
+def _drive_lines(context: dict, drive: str | None) -> list[str]:
+    lines = []
+    for d in context.get("磁盘", []):
+        if drive and d["盘符"].upper() != drive:
+            continue
+        pct = float(d.get("已用百分比") or 0)
+        state = "空间告急" if pct >= 92 else "空间紧张" if pct >= 85 else "空间充足"
+        lines.append(f"- **{d['盘符']}** 已用 {d['已用GB']} / {d['总计GB']} GB（{pct}%），剩余 **{d['剩余GB']} GB**，{state}")
+    return lines
+
+
+def _folder_lines(context: dict, drive: str | None, n: int = 6) -> list[str]:
+    folders = (context.get("各盘最大文件夹") or {}).get(drive) if drive else None
+    if not folders:
+        folders = [f for f in context.get("占用最大的文件夹", []) if _on_drive(f["目录"], drive)]
+    return [f"- `{f['目录']}` **{f['大小GB']:.1f} GB**（{util.human_count(f['文件数'])} 个文件）——{_folder_hint(f['目录'])}"
+            for f in folders[:n]]
+
+
+def _known_item(path: str):
+    """先按文件夹自己的名字匹配，再按整条路径匹配（AppData\\Local\\Temp 应该算「临时文件」而不是「AppData」）。"""
+    low = path.lower().rstrip("\\")
+    for text in (os.path.basename(low), low):
+        for item in KNOWN_ITEMS:
+            if any(k in text for k in item[0]):
+                return item
+    return None
+
+
+def _folder_hint(path: str) -> str:
+    item = _known_item(path)
+    if item:
+        return item[1]
+    if util.is_system_path(path):
+        return "系统 / 程序目录，不要手动删"
+    if "\\users\\" in path.lower():
+        return "个人文件，可以在「空间分布」里点进去看具体是什么"
+    return "可以在「空间分布」里点进去查看"
+
+
+def _file_lines(files: list[dict], drive: str | None, n: int = 8) -> list[str]:
+    out = []
+    for f in [f for f in files if _on_drive(f["路径"], drive)][:n]:
+        kind = EXT_KIND.get((f.get("扩展名") or "").lower(), "文件")
+        out.append(f"- `{f['路径']}` **{util.human_size(f['大小MB'] * MB)}**（{kind}，{f['修改日期']}）")
+    return out
+
+
+def _clean_lines(context: dict, drive: str | None, cache_only: bool = False, n: int = 10) -> list[str]:
+    items = [c for c in context.get("清理候选", []) if _on_drive(c["路径"], drive) and c["大小GB"] > 0]
+    if cache_only:
+        items = [c for c in items if "缓存" in c["类别"] or "临时" in c["类别"] or "缓存" in c["项目"]]
+    if not items:
+        return []
+    safe = sum(c["大小GB"] for c in items if c["等级"] == "安全" and c["可删除"])
+    caution = sum(c["大小GB"] for c in items if c["等级"] == "谨慎" and c["可删除"])
+    lines = [f"安全可删约 **{_gb(safe)}**，确认后可删约 **{_gb(caution)}**：", ""]
+    order = {"安全": 0, "谨慎": 1}
+    for c in sorted(items, key=lambda x: (order.get(x["等级"], 2), -x["大小GB"]))[:n]:
+        flag = {"安全": "✅ 安全", "谨慎": "⚠️ 谨慎"}.get(c["等级"], "⛔ 不建议")
+        lines.append(f"- {flag} **{c['项目']}** {_gb(c['大小GB'])}——{c['说明']}")
+    return lines
+
+
+def _match_records(low: str, context: dict) -> list[dict]:
+    """问题里提到了某个文件 / 文件夹的名字或路径时，从扫描数据里找出来。"""
+    seen, out = set(), []
+    candidates = [(f["路径"], f["大小MB"] * MB, f["修改日期"], False) for f in context.get("大文件Top", [])]
+    candidates += [(f["目录"], f["大小GB"] * GB, "", True) for f in context.get("占用最大的文件夹", [])]
+    for folders in (context.get("各盘最大文件夹") or {}).values():
+        candidates += [(f["目录"], f["大小GB"] * GB, "", True) for f in folders]
+    for chain in (context.get("大目录细分") or {}).values():
+        for spot in chain:
+            candidates += [(f["目录"], f["大小GB"] * GB, "", True) for f in spot["子文件夹"]]
+    for path, size, date, is_dir in candidates:
+        name = os.path.basename(path.rstrip("\\")).lower()
+        if len(name) < 3 or path.lower() in seen:
+            continue
+        if path.lower() in low or name in low:
+            seen.add(path.lower())
+            out.append({"path": path, "size": size, "date": date, "is_dir": is_dir})
+    return out[:5]
+
+
 def offline_chat_answer(question: str, context: dict) -> str:
+    """离线问答：按问题里的意图（为什么满 / 清理 / 大文件 / 最近变大 / 迁移）、盘符和提到的名字组合回答。"""
     q = (question or "").strip()
     if not q:
-        return "请输入你想问的问题，例如「C 盘为什么满了」「这个文件能删吗」。"
+        return "请输入你想问的问题，例如「C 盘为什么满了」「哪些可以安全删除」。"
     low = q.lower()
-    if "盘" in q and ("满" in q or "空" in q or "大" in q):
-        return offline_report(context)
-    if "删" in q or "清理" in q:
-        lines = ["下面是根据当前扫描数据整理的清理建议：", ""]
-        for c in sorted(context.get("清理候选", []), key=lambda x: -x["大小GB"])[:10]:
-            flag = "✅ 可删" if c.get("可删除") else "⛔ 勿删"
-            lines.append(f"- {flag} **{c['项目']}**（{c['大小GB']:.2f} GB）：{c['说明']}")
-        if len(lines) == 2:
-            lines.append("还没有清理分析结果，先去「清理推荐」页点一次「分析」。")
-        return "\n".join(lines)
-    if "文件" in q or "这个" in q:
-        return (
-            "离线模式只能基于扫描到的元数据判断。你可以在「大文件」或「最近文件」页选中一个文件，"
-            "右键 →「AI 分析此项」，我会给出这个文件的用途和删除建议。"
-        )
+    if not context.get("大文件Top") and not context.get("占用最大的文件夹"):
+        return "还没有扫描数据。先点右上角「完整扫描」（1～3 分钟），扫完再来问我。"
+    drive = _drive_in(q)
+    where = f"{drive[0]} 盘" if drive else "各盘"
+    out: list[str] = []
+
+    # 问到具体的东西（pagefile、微信、某个文件夹名）：只回答这些，不再附带整盘报告
+    sections: dict[str, list[str]] = {}
+    for item in KNOWN_ITEMS:
+        if any(k in low for k in item[0]):
+            sections.setdefault(item[1], [item[2]])
+    for rec in _match_records(low, context):
+        item = _known_item(rec["path"])
+        line = f"- 你电脑上的 `{rec['path']}`：**{util.human_size(rec['size'])}**"
+        if item:
+            sections.setdefault(item[1], [item[2]]).append(line)
+        elif rec["is_dir"]:
+            sections[rec["path"]] = [line, f"- 判断：{_folder_hint(rec['path'])}"]
+        else:
+            adv = file_advice(rec["path"], int(rec["size"]), 0)
+            sections[rec["path"]] = [line + f"（{adv['类型']}）", f"- 判断：{adv['判断']}", f"- 结论：**{adv['建议']}**"]
+    for title, lines in list(sections.items())[:4]:
+        name = os.path.basename(title.rstrip("\\")) if title[1:3] == ":\\" else title
+        out += [f"### {name}", *lines, ""]
+    specific = bool(out)
+
+    intents = {
+        "why": _has(q, _WHY), "clean": _has(q, _CLEAN), "big": _has(q, _BIG), "folder": _has(q, _FOLDER),
+        "recent": _has(q, _RECENT), "migrate": _has(q, _MIGRATE), "cache": _has(low, _CACHE),
+    }
+    if specific:
+        intents.update(why=False, clean=False, cache=False)
+    if _has(low, _HELP) and not any(intents.values()) and not specific:
+        return _help_text()
+    if not any(intents.values()) and not specific:
+        intents["why"] = True
+
+    if intents["why"]:
+        out += [f"## {where}磁盘现状", *_drive_lines(context, drive), ""]
+        folders = _folder_lines(context, drive)
+        if folders:
+            out += ["**占用最多的文件夹：**", *folders, ""]
+        for letter, chain in (context.get("大目录细分") or {}).items():
+            if drive and letter != drive:
+                continue
+            for spot in chain[:1] + chain[1:][-1:]:
+                out.append(f"**`{spot['目录']}`（{_gb(spot['大小GB'])}）里最大的是：**")
+                out += [f"- `{os.path.basename(f['目录'])}` **{_gb(f['大小GB'])}**——{_folder_hint(f['目录'])}"
+                        for f in spot["子文件夹"][:6]]
+                out.append("")
+        files = _file_lines(context.get("大文件Top", []), drive, 5)
+        if files:
+            out += ["**最大的几个文件：**", *files, ""]
+    if intents["big"] and not intents["why"]:
+        files = _file_lines(context.get("大文件Top", []), drive, 12)
+        out += [f"## {where}最大的文件", *(files or ["- 没有找到超过阈值的大文件。"]), ""]
+    if intents["folder"] and not intents["why"]:
+        out += [f"## {where}占用最多的文件夹", *(_folder_lines(context, drive, 10) or ["- 暂无数据。"]), ""]
+    if intents["recent"]:
+        grow = [g for g in context.get("最近增长最多的目录", []) if _on_drive(g["目录"], drive)][:8]
+        recent = _file_lines(context.get("最近7天变动的大文件", []), drive, 8)
+        out.append("## 最近变大的地方")
+        if grow:
+            out += ["**两次扫描之间增长最多的目录：**"]
+            out += [f"- `{g['目录']}` +{_gb(g['增长GB'])}（现在 {_gb(g['现在GB'])}）" + ("，新出现" if g["新出现"] else "")
+                    for g in grow]
+        if recent:
+            out += ["", "**最近 7 天新增或改动的大文件：**", *recent]
+        if not grow and not recent:
+            out.append("- 最近没有明显变大的目录或大文件。要对比增长，至少需要两次完整扫描。")
+        out.append("")
+    if intents["clean"] or intents["cache"] or intents["why"]:
+        lines = _clean_lines(context, drive, cache_only=intents["cache"] and not intents["clean"])
+        title = "可以清理的缓存" if intents["cache"] and not intents["clean"] else f"{where}可以清理什么"
+        out.append(f"## {title}")
+        out += lines or ["- 还没有清理分析结果：点顶部「分析可清理项」，几十秒后再问我。"]
+        if lines:
+            out += ["", "到「清理推荐」页勾选后点「移到回收站」，或直接点顶部「一键安全清理」。"]
+        out.append("")
+    if intents["migrate"]:
+        out += ["## 迁移到其它盘", *_migrate_lines(context), ""]
+
+    out.append("> 离线规则分析（不联网）。到「设置 → AI」填写 API Key 后可以自由提问、获得更细的分析。")
+    return "\n".join(out).strip()
+
+
+def _migrate_lines(context: dict) -> list[str]:
+    movable = [(c["路径"], c["大小GB"]) for c in context.get("清理候选", [])
+               if c["路径"].upper().startswith("C:") and "迁移" in c["说明"] and c["大小GB"] >= 1]
+    if not movable:
+        chain = (context.get("大目录细分") or {}).get("C:")
+        folders = [f for spot in chain for f in spot["子文件夹"]] if chain else \
+            (context.get("各盘最大文件夹") or {}).get("C:", [])
+        movable = [(f["目录"], f["大小GB"]) for f in folders
+                   if not util.is_system_path(f["目录"]) and "appdata" not in f["目录"].lower() and f["大小GB"] >= 1]
+    lines = ["在「空间分布」里右键一个大文件夹 →「迁移到其它盘」：程序会把它复制到 D 盘，"
+             "并在原位置留一个目录联接，**原来的路径照常能用**，任何一步失败都会自动回滚。", ""]
+    if movable:
+        lines.append("C 盘里适合迁移的大文件夹：")
+        lines += [f"- `{path}` {_gb(size)}" for path, size in sorted(movable, key=lambda m: -m[1])[:8]]
+    lines += ["", "不要迁移：Windows、Program Files、正在运行的软件目录，以及 AppData 整个目录。"]
+    return lines
+
+
+def _help_text() -> str:
     return (
-        "离线规则引擎只支持有限的问答。你可以：\n"
-        "- 点「分析整体」查看完整报告；\n"
-        "  或在「设置」里填写 API Key，启用更灵活的 AI 分析。"
+        "我可以根据扫描数据回答这些问题（离线也能用）：\n\n"
+        "- **C 盘为什么满了** / D 盘空间去哪了\n"
+        "- **哪些能安全删除** / 有哪些缓存可以清\n"
+        "- **最近什么变大了**\n"
+        "- **最大的文件有哪些**、最大的文件夹有哪些\n"
+        "- **哪些可以迁移到 D 盘**\n"
+        "- 某个东西能不能删，比如「pagefile.sys 能删吗」「微信文件太大怎么办」「node_modules」\n\n"
+        "也可以在任意列表里选中文件 / 文件夹，再点「分析选中项」。"
     )
 
 
@@ -311,7 +623,7 @@ MAX_CONTEXT_CHARS = 16000
 RETRY_CODES = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524}
 DONE = "[DONE]"
 _VERSION_RE = re.compile(r"/v\d+[a-z]*$", re.I)
-_TRIM_KEYS = ("大文件Top", "清理候选", "占用最大的文件夹", "选中项")
+_TRIM_KEYS = ("大文件Top", "清理候选", "占用最大的文件夹", "最近7天变动的大文件", "最近增长最多的目录", "选中项")
 
 
 @dataclass
@@ -355,7 +667,7 @@ def _headers(settings: ApiSettings, stream: bool) -> dict:
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream" if stream else "application/json",
-        "User-Agent": "HardDriveMonitor/2",
+        "User-Agent": f"HardDriveMonitor/{__version__}",
     }
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"

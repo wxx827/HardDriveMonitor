@@ -5,6 +5,7 @@ import ctypes
 import os
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -123,7 +124,7 @@ class SettingsPage(Page):
         self.body.addWidget(mon)
 
         # ---- AI ----
-        ai_card = Card("AI 助手（可选）")
+        ai_card = self.ai_card = Card("AI 助手（可选）")
         ai_card.body.addWidget(label("不填写时使用离线规则分析，不联网。支持任何 OpenAI 兼容接口（含本地 Ollama / LM Studio，"
                                      "本地服务不用填 Key）；API Key 用 Windows DPAPI 加密保存。", "muted", wrap=True))
         form = _form()
@@ -229,6 +230,14 @@ class SettingsPage(Page):
 
     def on_show(self) -> None:
         pass
+
+    def focus_ai(self) -> None:
+        """从 AI 面板跳过来：滚到 AI 设置，光标放进 API Key 输入框。"""
+        def go():
+            self.scroll_area.verticalScrollBar().setValue(self.ai_card.y())
+            self.api_key.setFocus()
+
+        QTimer.singleShot(0, go)
 
     # ---------------- 保存 ----------------
     def save(self) -> None:

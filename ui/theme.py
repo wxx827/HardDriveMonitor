@@ -203,9 +203,14 @@ QMenu::item {{ padding: 6px 22px 6px 14px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {c['accent_soft']}; color: {c['accent']}; }}
 QMenu::item:disabled {{ color: {c['muted']}; }}
 QMenu::separator {{ height: 1px; background: {c['border']}; margin: 4px 8px; }}
-QDockWidget {{ titlebar-close-icon: none; }}
-QDockWidget::title {{ background: {c['panel']}; padding: 8px 12px; border-bottom: 1px solid {c['border']}; }}
+#AiTitle {{ background: {c['panel']}; border-left: 1px solid {c['border']}; border-bottom: 1px solid {c['border']}; }}
+#AiTitle QLabel {{ background: transparent; }}
 #AiPanel {{ background: {c['panel']}; border-left: 1px solid {c['border']}; }}
+QPushButton[kind="chip"] {{
+    background: {c['panel_alt']}; border: 1px solid {c['border']}; border-radius: 14px;
+    padding: 4px 12px; color: {c['text']}; font-size: 9.5pt;
+}}
+QPushButton[kind="chip"]:hover {{ background: {c['accent_soft']}; border-color: {c['accent']}; color: {c['accent']}; }}
 QTabBar::tab {{ padding: 6px 14px; }}
 """
 

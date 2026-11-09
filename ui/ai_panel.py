@@ -6,7 +6,7 @@ import time
 import traceback
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QFileDialog, QPlainTextEdit, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFileDialog, QGridLayout, QPlainTextEdit, QTextBrowser, QVBoxLayout, QWidget
 
 from core import ai, util, volumes
 from core.config import is_local_url
@@ -14,14 +14,26 @@ from . import workers
 from .widgets.common import button, confirm, hbox, info, label
 
 WELCOME = (
-    "### AI 助手\n\n"
-    "- **分析整体**：根据当前扫描数据生成磁盘报告\n"
-    "- **分析选中项**：先在任意列表里选中文件 / 文件夹\n"
-    "- 也可以直接提问，例如「C 盘为什么快满了」\n\n"
-    "> 默认离线规则分析（不联网）；在「设置 → AI」里填写 API Key（或本地 Ollama / LM Studio 地址）后可用大模型。"
+    "### 你好，我是 AI 助手\n\n"
+    "点上面的常见问题，或者直接输入，例如：\n\n"
+    "- C 盘为什么快满了？\n"
+    "- pagefile.sys / 微信文件 / node_modules 能删吗？\n"
+    "- 哪些文件夹可以迁移到 D 盘？\n\n"
+    "也可以先在「空间分布」「大文件」「清理推荐」里选中文件，再点「分析选中项」。\n\n"
+    "> 没有填写 API Key 时使用离线规则分析，不联网也能回答上面这些问题；"
+    "到「AI 设置」填写 DeepSeek 等服务的 Key（或本地 Ollama 地址）后可以自由提问。"
 )
 
 SELECTION_QUESTION = "请分析我选中的这些项：它们是什么、为什么占空间、能不能删、应该怎么处理？"
+
+QUICK_QUESTIONS = [
+    ("C 盘为什么满了", "C 盘为什么快满了？空间都被什么占了？"),
+    ("哪些能安全删", "哪些东西可以安全删除？能释放多少空间？"),
+    ("最近什么变大了", "最近什么变大了？"),
+    ("能迁移什么到 D 盘", "C 盘有哪些大文件夹可以迁移到 D 盘？"),
+]
+
+CONTEXT_TTL = 90
 
 
 class _Input(QPlainTextEdit):
@@ -50,21 +62,41 @@ class AiPanel(QWidget):
         self.busy = False
         self._cancel = threading.Event()
         self._gen = 0
+        self._answer_top: int | None = None
+        self._jump_to: int | None = None
+        self._ctx_lock = threading.Lock()
+        self._ctx_cache: tuple | None = None
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(120)
         self._render_timer.timeout.connect(self._render)
+        win.indexChanged.connect(self.invalidate_context)
+        win.cleanupChanged.connect(self.invalidate_context)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 12)
+        lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
-        self.mode_label = label("", "muted", wrap=True)
-        lay.addWidget(self.mode_label)
+        self.mode_label = label("", "small", wrap=True)
+        self.settings_btn = button("AI 设置", "ghost", "settings", "填写 API Key / 选择模型", self._open_settings)
+        top = hbox(self.mode_label, self.settings_btn)
+        top.setStretch(0, 1)
+        lay.addLayout(top)
+
         self.overview_btn = button("分析整体", "primary", "sparkle", on_click=self.ask_overview)
-        self.selection_btn = button("分析选中项", None, None, on_click=self.ask_selection)
+        self.selection_btn = button("分析选中项", None, None, "先在列表里选中文件或文件夹", self.ask_selection)
         self.stop_btn = button("停止", None, "stop", on_click=self.stop)
         self.stop_btn.setEnabled(False)
         lay.addLayout(hbox(self.overview_btn, self.selection_btn, self.stop_btn, None))
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        self.quick_btns = []
+        for i, (text, question) in enumerate(QUICK_QUESTIONS):
+            btn = button(text, None, None, question, lambda q=question: self.ask(q))
+            btn.setProperty("kind", "chip")
+            grid.addWidget(btn, i // 2, i % 2)
+            self.quick_btns.append(btn)
+        lay.addLayout(grid)
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
@@ -85,12 +117,44 @@ class AiPanel(QWidget):
         cfg = self.win.config
         if cfg.ai_ready():
             where = "本地模型" if is_local_url(cfg.ai.get("base_url") or "") else "在线模型"
-            self.mode_label.setText(f"{where} · {cfg.ai.get('model')}　路径中的用户名默认脱敏，不发送文件内容。")
+            self.mode_label.setText(f"{where}：{cfg.ai.get('model')}。路径里的用户名默认脱敏，不发送文件内容。")
         else:
-            self.mode_label.setText("离线规则分析（不联网）。到「设置 → AI」填写 API Key 或本地模型地址可切换。")
+            self.mode_label.setText("当前是离线规则分析（不联网）。填写 API Key 后可以自由提问。")
 
     def focus_input(self) -> None:
         self.input.setFocus()
+
+    def _open_settings(self) -> None:
+        self.win.goto("settings")
+        self.win.pages["settings"].focus_ai()
+
+    def invalidate_context(self) -> None:
+        with self._ctx_lock:
+            self._ctx_cache = None
+
+    def _context(self, cleanup_items: list, mask: bool, selection: list[dict] | None) -> dict:
+        """扫描上下文缓存一小会儿，连续追问不用每次都查索引。"""
+        with self._ctx_lock:
+            cached = self._ctx_cache
+        if cached and cached[0] == mask and time.monotonic() - cached[1] < CONTEXT_TTL:
+            context = dict(cached[2])
+        else:
+            context = ai.build_context(self.win.index, volumes.list_volumes(), cleanup_items, mask=mask)
+            with self._ctx_lock:
+                self._ctx_cache = (mask, time.monotonic(), context)
+            context = dict(context)
+        if selection:
+            context["选中项"] = [
+                {
+                    "路径": util.mask_user(rec.get("path", "")) if mask else rec.get("path", ""),
+                    "大小": util.human_size(rec.get("size") or 0),
+                    "修改时间": util.fmt_date(rec.get("mtime") or 0),
+                    "扩展名": rec.get("ext") or "",
+                    "类型": "文件夹" if rec.get("is_dir") else "文件",
+                }
+                for rec in selection[:20]
+            ]
+        return context
 
     # ---------------- 发送 ----------------
     def ask_overview(self) -> None:
@@ -106,6 +170,9 @@ class AiPanel(QWidget):
     def ask_records(self, records: list[dict]) -> None:
         if records:
             self._start(SELECTION_QUESTION, "selection", records)
+
+    def ask(self, question: str) -> None:
+        self._start(question, "chat", None)
 
     def send(self) -> None:
         question = self.input.toPlainText().strip()
@@ -141,9 +208,14 @@ class AiPanel(QWidget):
         self.started = time.monotonic()
         self.online = online
         self._render()
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self._answer_top = max(0, int(self.view.document().size().height()) - 110)
         history = list(self.history)
         self.history.append(ai.ChatMessage("user", question))
-        context_args = (self.win.index, list(self.win.cleanup_items), bool(cfg.privacy.get("mask_user", True)))
+        # 离线分析不出本机，不用脱敏，路径显示完整
+        mask = online and bool(cfg.privacy.get("mask_user", True))
+        cleanup_items = list(self.win.cleanup_items)
         settings = ai.ApiSettings.from_config(cfg)
         cancel = self._cancel
 
@@ -152,7 +224,7 @@ class AiPanel(QWidget):
 
         def worker():
             try:
-                context = _context(*context_args, selection)
+                context = self._context(cleanup_items, mask, selection)
                 if not online:
                     if scope == "chat":
                         text = ai.offline_chat_answer(question, context)
@@ -161,7 +233,7 @@ class AiPanel(QWidget):
                     emit("delta", text)
                     emit("done")
                     return
-                messages = ai.build_messages(context, question, history, scope=scope, mask=context_args[2])
+                messages = ai.build_messages(context, question, history, scope=scope, mask=mask)
                 for kind, text in ai.stream_chat(settings, messages, cancel):
                     emit("delta" if kind == "content" else "reasoning", text)
                 emit("stopped" if cancel.is_set() else "done")
@@ -194,13 +266,18 @@ class AiPanel(QWidget):
             self.transcript += self._buffer()
             if self.online:
                 self.transcript += f"\n\n*用时 {elapsed:.0f} 秒*\n"
+            else:
+                self._jump_to = self._answer_top
             if self.answer:
                 self.history.append(ai.ChatMessage("assistant", self.answer[-4000:]))
+            self.win.status("AI 回答完成")
         elif kind == "stopped":
             self.transcript += self._buffer() + "\n\n> 已停止生成。\n"
             self._gen += 1
+            self.win.status("AI 已停止")
         elif kind == "error":
             self.transcript += self._buffer() + f"\n\n> ⚠️ {payload}\n"
+            self.win.status("AI 请求失败，详情见 AI 面板")
         self.answer = ""
         self.thinking = 0
         self._set_busy(False)
@@ -216,17 +293,23 @@ class AiPanel(QWidget):
             return text + f"> 正在思考…（已推理 {self.thinking:,} 字，{time.monotonic() - self.started:.0f} 秒）\n"
         if self.online:
             return text + "> 正在连接模型…\n"
-        return text
+        return text + "> 正在整理扫描数据…\n"
 
     def _render(self) -> None:
         self._render_timer.stop()
-        self.view.setMarkdown(self.transcript + self._buffer())
         bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        old = bar.value()
+        follow = old >= bar.maximum() - 48
+        self.view.setMarkdown(self.transcript + self._buffer())
+        if self._jump_to is not None:
+            bar.setValue(min(self._jump_to, bar.maximum()))
+            self._jump_to = None
+        else:
+            bar.setValue(bar.maximum() if follow else old)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
-        for btn in (self.overview_btn, self.selection_btn, self.send_btn):
+        for btn in (self.overview_btn, self.selection_btn, self.send_btn, *self.quick_btns):
             btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         if busy:
@@ -255,19 +338,3 @@ class AiPanel(QWidget):
             info(self, "导出失败", str(exc))
             return
         self.win.status(f"已导出到 {path}")
-
-
-def _context(index, cleanup_items, mask: bool, selection: list[dict] | None) -> dict:
-    context = ai.build_context(index, volumes.list_volumes(), cleanup_items, mask=mask)
-    if selection:
-        context["选中项"] = [
-            {
-                "路径": util.mask_user(rec.get("path", "")) if mask else rec.get("path", ""),
-                "大小": util.human_size(rec.get("size") or 0),
-                "修改时间": util.fmt_date(rec.get("mtime") or 0),
-                "扩展名": rec.get("ext") or "",
-                "类型": "文件夹" if rec.get("is_dir") else "文件",
-            }
-            for rec in selection[:20]
-        ]
-    return context

@@ -34,7 +34,7 @@ Windows 自带的「存储」只告诉你“其他 120 GB”，资源管理器�
 - 🧹 **清理推荐**：pip / npm / Gradle / Maven / conda / HuggingFace 缓存、浏览器缓存、微信 / QQ / 飞书缓存、Windows 更新缓存、旧安装包、重复文件、`node_modules` 等，一键清理「安全」项。
 - 📦 **C 盘大目录迁移**：把大目录复制到其它盘，并在原位置建立目录联接（junction），**原路径照常可用**；任何一步失败自动回滚。
 - 📈 **监视与告警**：剩余空间历史曲线，低于阈值或短时间内骤降时托盘通知；可开机自启、最小化到托盘。
-- 🤖 **AI 助手（可选）**：默认用离线规则生成中文分析报告；接入 DeepSeek / 通义千问 / Kimi / 智谱 / OpenAI / Ollama 等 OpenAI 兼容接口后可以直接提问。
+- 🤖 **AI 助手**：右侧边栏，不联网也能回答「C 盘为什么满了」「哪些能安全删」「最近什么变大了」「能迁移什么到 D 盘」「pagefile.sys 能删吗」这类问题，会一路钻到具体是哪个文件夹占的空间；接入 DeepSeek / 通义千问 / Kimi / 智谱 / OpenAI / Ollama 等 OpenAI 兼容接口后可以自由提问。
 - 🌗 浅色 / 深色主题，Fluent 风格界面。
 
 ## 截图
@@ -113,7 +113,7 @@ scripts/          打包与截图脚本
 ## 开发
 
 ```powershell
-python -m unittest discover -s tests      # 运行测试（136 个）
+python -m unittest discover -s tests      # 运行测试（142 个）
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包成 dist\硬盘监视器.exe
 ```
 

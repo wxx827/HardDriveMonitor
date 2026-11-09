@@ -12,8 +12,9 @@ class Page(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        self.scroll_area = None
         if scroll:
-            area = QScrollArea()
+            area = self.scroll_area = QScrollArea()
             area.setWidgetResizable(True)
             area.setFrameShape(QFrame.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)

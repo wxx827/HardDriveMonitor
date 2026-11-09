@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core import cleanup, jobs, monitor, recommend, scanner, sync, util, volumes, watch
+from core import __version__, cleanup, jobs, monitor, recommend, scanner, sync, util, volumes, watch
 from core.config import Config
 from core.index import Index
 from . import theme, workers
@@ -35,7 +35,7 @@ from .pages.monitor import MonitorPage
 from .pages.recent import RecentPage
 from .pages.settings import SettingsPage
 from .tray import Tray
-from .widgets.common import app_icon, button, confirm, error, glyph_icon, info, label, warn
+from .widgets.common import app_icon, button, confirm, error, glyph_icon, info, label, tool_button, warn
 
 PAGES = [
     ("dashboard", "概览", "home", DashboardPage),
@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
             self.pages[key] = page
             self.stack.addWidget(page)
         nav_lay.addStretch(1)
-        self.nav_footer = QLabel("")
+        self.nav_footer = QLabel(f"v{__version__}")
         self.nav_footer.setObjectName("NavFooter")
         self.nav_footer.setWordWrap(True)
         nav_lay.addWidget(self.nav_footer)
@@ -174,18 +174,33 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.last_scan_label)
 
         self.ai_panel = AiPanel(self)
-        self.ai_dock = QDockWidget("问 AI", self)
+        self.ai_dock = QDockWidget("AI 助手", self)
         self.ai_dock.setObjectName("AiDock")
         self.ai_dock.setWidget(self.ai_panel)
-        self.ai_dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable)
-        self.ai_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-        self.ai_dock.setMinimumWidth(380)
+        self.ai_dock.setTitleBarWidget(self._ai_title_bar())
+        # 只能停在右侧：可拖动时一不小心就被拖成别的布局，用户找不回来
+        self.ai_dock.setFeatures(QDockWidget.DockWidgetClosable)
+        self.ai_dock.setAllowedAreas(Qt.RightDockWidgetArea)
+        self.ai_dock.setMinimumWidth(360)
         self.addDockWidget(Qt.RightDockWidgetArea, self.ai_dock)
         self.ai_dock.hide()
         self.ai_dock.visibilityChanged.connect(self.ai_btn.setChecked)
+        self._ai_sized = False
 
         self.nav_buttons["dashboard"].setChecked(True)
         self._update_busy()
+
+    def _ai_title_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("AiTitle")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 8, 8, 8)
+        title = label("AI 助手", "h2")
+        lay.addWidget(title)
+        lay.addStretch(1)
+        close = tool_button("close", "收起（Ctrl+J）", lambda: self.ai_dock.hide())
+        lay.addWidget(close)
+        return bar
 
     def _build_timers(self) -> None:
         self.sample_timer = QTimer(self)
@@ -789,13 +804,18 @@ class MainWindow(QMainWindow):
         if self.ai_dock.isVisible():
             self.ai_dock.hide()
         else:
-            self.ai_dock.show()
-            self.ai_panel.refresh_mode()
+            self._show_ai()
             self.ai_panel.focus_input()
 
-    def ask_ai(self, records: list[dict]) -> None:
+    def _show_ai(self) -> None:
         self.ai_dock.show()
+        if not self._ai_sized:
+            self._ai_sized = True
+            self.resizeDocks([self.ai_dock], [440], Qt.Horizontal)
         self.ai_panel.refresh_mode()
+
+    def ask_ai(self, records: list[dict]) -> None:
+        self._show_ai()
         self.ai_panel.ask_records(records)
 
     # ================= 监视 =================

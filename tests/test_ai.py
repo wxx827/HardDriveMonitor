@@ -149,6 +149,59 @@ class OfflineReportTests(unittest.TestCase):
         ctx = ai.build_context(self.index, [self.vol], [], mask=True)
         answer = ai.offline_chat_answer("C 盘满了怎么办", ctx)
         self.assertIn("磁盘", answer)
+        self.assertIn("C:\\Users", answer)
+
+    def test_chat_clean_filters_drive(self):
+        items = [CleanItem("临时文件", "用户临时目录", r"C:\Temp", 7 * 1024 ** 3, "safe", "临时", True, "dir_contents"),
+                 CleanItem("缓存与开发", "D 盘缓存", r"D:\cache", 3 * 1024 ** 3, "safe", "缓存", True, "dir")]
+        ctx = ai.build_context(self.index, [self.vol], items, mask=False)
+        answer = ai.offline_chat_answer("C盘哪些可以删", ctx)
+        self.assertIn("用户临时目录", answer)
+        self.assertNotIn("D 盘缓存", answer)
+        self.assertIn("7.00 GB", answer)
+
+    def test_chat_known_item(self):
+        items = [CleanItem("临时文件", "用户临时目录", r"C:\Temp", 7 * 1024 ** 3, "safe", "临时", True, "dir_contents")]
+        ctx = ai.build_context(self.index, [self.vol], items, mask=False)
+        answer = ai.offline_chat_answer("hiberfil.sys 能删吗", ctx)
+        self.assertIn("powercfg -h off", answer)
+        self.assertNotIn("用户临时目录", answer)
+
+    def test_hotspot_drills_into_dominant_folder(self):
+        from core.scanner import DirRec
+
+        now = int(time.time())
+        gb = 1024 ** 3
+        self.index.replace_scan([], [
+            DirRec("C:\\Users", "C:\\", "C:", 2, 300 * gb, 10, now),
+            DirRec("C:\\Windows", "C:\\", "C:", 2, 40 * gb, 10, now),
+            DirRec("C:\\Users\\wjx", "C:\\Users", "C:", 3, 290 * gb, 10, now),
+            DirRec("C:\\Users\\wjx\\AppData", "C:\\Users\\wjx", "C:", 4, 90 * gb, 10, now),
+            DirRec("C:\\Users\\wjx\\Videos", "C:\\Users\\wjx", "C:", 4, 80 * gb, 10, now),
+        ], [], [])
+        ctx = ai.build_context(self.index, [self.vol], [], mask=False)
+        chain = ctx["大目录细分"]["C:"]
+        self.assertEqual([spot["目录"] for spot in chain], ["C:\\Users\\wjx"])
+        self.assertEqual([os.path.basename(f["目录"]) for f in chain[0]["子文件夹"]], ["AppData", "Videos"])
+        answer = ai.offline_chat_answer("C盘为什么满了", ctx)
+        self.assertIn("Videos", answer)
+        self.assertIn("C:\\Users\\wjx\\Videos", ai.offline_chat_answer("能迁移什么到 D 盘", ctx))
+
+    def test_chat_mentions_indexed_file(self):
+        ctx = ai.build_context(self.index, [self.vol], [], mask=False)
+        answer = ai.offline_chat_answer("data.pt 是什么", ctx)
+        self.assertIn("模型权重", answer)
+
+    def test_chat_recent_and_migrate(self):
+        ctx = ai.build_context(self.index, [self.vol], [], mask=False)
+        self.assertTrue(ctx["最近7天变动的大文件"])
+        self.assertIn("data.pt", ai.offline_chat_answer("最近什么变大了", ctx))
+        self.assertIn("目录联接", ai.offline_chat_answer("能迁移什么到 D 盘", ctx))
+
+    def test_chat_help_and_empty_index(self):
+        ctx = ai.build_context(self.index, [self.vol], [], mask=False)
+        self.assertIn("C 盘为什么满了", ai.offline_chat_answer("你好", ctx))
+        self.assertIn("完整扫描", ai.offline_chat_answer("C盘满了", {"磁盘": []}))
 
     def test_build_messages(self):
         ctx = {"磁盘": []}
